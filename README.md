@@ -109,7 +109,7 @@ To collect a report:
 
 1. Open browser developer tools.
 2. Run `BackreferencesPerf.enable()` in the console.
-3. Reload Thymer.
+3. Reload Thymer (F5).
 4. Open notes that feel slow, expand/collapse Backreferences sections, try the filter bar, and expand Unlinked References if that workflow is slow.
 5. Run `copy(BackreferencesPerf.report())` in the console.
 6. Paste the copied JSON into the bug report.
