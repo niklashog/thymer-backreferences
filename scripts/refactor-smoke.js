@@ -212,6 +212,7 @@ function makePlugin() {
   plugin._propertyIndexBuildSeq = 0;
   plugin._propertyIndexRebuildTimer = null;
   plugin._propertyIndexNeedsRebuild = false;
+  plugin._propertyIndexCollectionFetchConcurrency = 4;
   plugin._maxStoredPageViewRecords = 400;
   plugin._maxStoredSortByRecords = 400;
   plugin._maxStoredPropGroupStates = 160;
@@ -775,6 +776,41 @@ test('graph property index dedupes duplicate record objects', async () => {
   assert.equal(groups[0].records.length, 1);
   assert.equal(groups[0].records[0].guid, source.guid);
   assert.deepEqual(plugin.getPropertyBacklinkGroupsFromIndex(staleTargetGuid, { showSelf: false }), []);
+});
+
+test('graph property index fetches collection records with bounded concurrency', async () => {
+  const plugin = makePlugin();
+  const targetGuid = 'target-guid';
+  let activeFetches = 0;
+  let maxActiveFetches = 0;
+
+  plugin._propertyIndexCollectionFetchConcurrency = 2;
+  plugin.data.getAllCollections = async () => Array.from({ length: 5 }, (_, index) => ({
+    guid: `collection-${index}`,
+    async getAllRecords() {
+      activeFetches += 1;
+      maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeFetches -= 1;
+      return [
+        makeRecord({
+          guid: `source-${index}`,
+          name: `Source ${index}`,
+          properties: [makeProperty('Entity', ['record', targetGuid])]
+        })
+      ];
+    }
+  }));
+
+  await plugin.rebuildPropertyIndex({ reason: 'test' });
+
+  assert.equal(plugin._propertyIndexStatus, 'ready');
+  assert.equal(maxActiveFetches, 2);
+  assert.equal(plugin._propertyIndexStats.scannedRecords, 5);
+  assert.deepEqual(
+    plugin.getPropertyBacklinkGroupsFromIndex(targetGuid, { showSelf: false })[0].records.map((record) => record.guid),
+    ['source-0', 'source-1', 'source-2', 'source-3', 'source-4']
+  );
 });
 
 test('linked and unlinked grouping preserves source grouping rules', () => {
