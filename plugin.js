@@ -43,6 +43,7 @@ class Plugin extends AppPlugin {
     this._propertyIndexBuildSeq = 0;
     this._propertyIndexRebuildTimer = null;
     this._propertyIndexNeedsRebuild = false;
+    this._propertyIndexCollectionFetchConcurrency = 4;
     this._queryAutocompleteCatalog = null;
     this._queryAutocompleteCatalogPromise = null;
     this._perfStorageKey = 'thymer_backreferences_perf_v1';
@@ -3561,22 +3562,72 @@ class Plugin extends AppPlugin {
         throw new Error('Thymer graph collections could not be read.');
       }
 
+      const indexableCollections = collections
+        .map((collection, index) => ({ collection, index }))
+        .filter((entry) => entry.collection && typeof entry.collection.getAllRecords === 'function');
+      const collectionFetchConcurrency = this.coercePositiveInt(
+        this._propertyIndexCollectionFetchConcurrency,
+        4
+      );
+      const collectionFetches = [];
+      const collectionFetchesStartedAt = this.perfNow();
+      const collectionRecordSets = await this.mapWithConcurrency(
+        indexableCollections,
+        collectionFetchConcurrency,
+        async ({ collection, index }) => {
+          if (this._propertyIndexBuildSeq !== seq) return null;
+
+          const recordsStartedAt = this.perfNow();
+          let records = [];
+          let error = null;
+          let collectionGuid = '';
+          try {
+            collectionGuid = ((collection.guid || collection.getGuid?.() || '') + '').trim();
+          } catch (e) {
+            collectionGuid = '';
+          }
+
+          try {
+            records = await collection.getAllRecords();
+          } catch (e) {
+            error = e;
+            records = [];
+          }
+          const fetchMs = Math.round((this.perfNow() - recordsStartedAt) * 10) / 10;
+          const recordCount = Array.isArray(records) ? records.length : 0;
+          const fetchSummary = {
+            collectionIndex: index,
+            collectionGuid,
+            ms: fetchMs,
+            records: recordCount,
+            error: error ? true : undefined
+          };
+          collectionFetches.push(fetchSummary);
+
+          this.perfStep(perf, 'get collection records', recordsStartedAt, {
+            collectionIndex: index,
+            collectionGuid,
+            records: recordCount,
+            error: error ? true : undefined
+          });
+
+          if (error || !Array.isArray(records)) return null;
+          return { records };
+        }
+      );
+      this.perfStep(perf, 'fetch collection records total', collectionFetchesStartedAt, {
+        collections: indexableCollections.length,
+        concurrency: collectionFetchConcurrency
+      });
+
       let lastNotifyAt = Date.now();
       let collectionCount = 0;
-      for (const collection of collections) {
-        if (!collection || typeof collection.getAllRecords !== 'function') continue;
-        let records = [];
-        try {
-          const recordsStartedAt = this.perfNow();
-          records = await collection.getAllRecords();
-          collectionCount += 1;
-          this.perfStep(perf, 'get collection records', recordsStartedAt, {
-            records: Array.isArray(records) ? records.length : 0
-          });
-        } catch (e) {
-          continue;
-        }
-        if (!Array.isArray(records)) continue;
+      const indexingStartedAt = this.perfNow();
+      for (const recordSet of collectionRecordSets) {
+        if (this._propertyIndexBuildSeq !== seq) return;
+        const records = Array.isArray(recordSet?.records) ? recordSet.records : null;
+        if (!records) continue;
+        collectionCount += 1;
 
         for (const record of records) {
           if (this._propertyIndexBuildSeq !== seq) return;
@@ -3594,6 +3645,10 @@ class Plugin extends AppPlugin {
           }
         }
       }
+      this.perfStep(perf, 'index property records', indexingStartedAt, {
+        collections: collectionCount,
+        records: this._propertyIndexStats.scannedRecords || 0
+      });
 
       if (this._propertyIndexBuildSeq !== seq) return;
 
@@ -3609,9 +3664,15 @@ class Plugin extends AppPlugin {
       this._propertyIndexError = '';
       this.perfCount(perf, {
         collections: collectionCount,
+        failedCollections: collectionFetches.filter((item) => item?.error === true).length,
         scannedRecords: this._propertyIndexStats.scannedRecords || 0,
         indexedReferences: this._propertyIndexStats.indexedReferences || 0,
-        indexedTargets: this._propertyIndexStats.indexedTargets || 0
+        indexedTargets: this._propertyIndexStats.indexedTargets || 0,
+        collectionFetchConcurrency,
+        slowestCollectionFetches: collectionFetches
+          .slice()
+          .sort((a, b) => (b?.ms || 0) - (a?.ms || 0))
+          .slice(0, 5)
       });
       this.notifyPropertyIndexChanged(reason || 'property-index-ready');
     } catch (e) {
@@ -3630,6 +3691,28 @@ class Plugin extends AppPlugin {
         this.schedulePropertyIndexRebuild('queued-property-index-rebuild', 0);
       }
     }
+  }
+
+  async mapWithConcurrency(items, concurrency, mapper) {
+    const list = Array.isArray(items) ? items : [];
+    const limit = Math.max(1, Math.min(this.coercePositiveInt(concurrency, 1), list.length || 1));
+    const results = new Array(list.length);
+    let nextIndex = 0;
+
+    const worker = async () => {
+      while (nextIndex < list.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        try {
+          results[index] = await mapper(list[index], index);
+        } catch (e) {
+          results[index] = null;
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: limit }, () => worker()));
+    return results;
   }
 
   waitForIndexYield() {
